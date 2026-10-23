@@ -6,6 +6,9 @@ local Playback = require('playback')
 local Runs = require('runs')
 local Paint = require('paint')
 local Ghost = require('ghost')
+local Coaching = require('coaching')
+local Lesson = require('lesson')
+local Visuals = require('visuals')
 
 local shared = ac.connect({
   ac.StructItem.key('driftCoach.v1'),
@@ -21,8 +24,18 @@ local shared = ac.connect({
   angleDelta = ac.StructItem.float(),
 }, true)
 
+-- Additive channel: keep v1 compatible with previously installed HUDs.
+local coachContext = ac.connect({
+  ac.StructItem.key('driftCoach.context.v1'),
+  available = ac.StructItem.boolean(), beat = ac.StructItem.int32(), status = ac.StructItem.int32(),
+  gas = ac.StructItem.float(), brake = ac.StructItem.float(), speed = ac.StructItem.float(),
+  gear = ac.StructItem.int32(), cue = ac.StructItem.int32(), cueIn = ac.StructItem.float(),
+  gasTrend = ac.StructItem.int32(), brakeTrend = ac.StructItem.int32(),
+}, true)
+
 local prefs = ac.storage({
   line = true, ghost = true, opacity = 0.9, radius = 4, teaching = '', teachingKey = '', recordName = 'Teaching run',
+  sectionRun = '', sectionStart = 0, sectionEnd = 0, guides = true,
 }, 'driftCoach.')
 local recordButton = ac.ControlButton('driftCoach/Record')
 local resetButton = ac.ControlButton('driftCoach/Reset ghost')
@@ -32,6 +45,12 @@ local paint = Paint.new()
 local ghost = Ghost.new()
 local active, message, status, indexKey, index, renameDraft, pendingDelete, bootedKey
 local anchorX, anchorY, anchorZ
+local practice, attempt = nil, Lesson.new()
+local sectionFrom, sectionTo = 0, 0
+local visualRecorder = Visuals.new()
+local recordingContext, recordingSkin
+local lastSummary
+local followKey
 
 local function clamp(value, low, high)
   value = type(value) == 'number' and value == value and math.abs(value) ~= math.huge and value or low
@@ -65,7 +84,14 @@ local function runsFor(context)
   return index
 end
 
-local function publish(match)
+local function resetAttempt(discardSummary)
+  if discardSummary then lastSummary = nil
+  elseif attempt.started then lastSummary = Lesson.summary(attempt, true) end
+  Playback.resetPlayer(player)
+  attempt = Lesson.new()
+end
+
+local function publish(match, reference)
   shared.beat = shared.beat + 1
   if shared.beat > 2000000000 then shared.beat = 1 end
   shared.active = match ~= nil
@@ -77,6 +103,12 @@ local function publish(match)
   shared.slip = match and match.slip or 0
   shared.delta = match and match.delta or 0
   shared.angleDelta = match and match.angleDelta or 0
+  coachContext.beat = shared.beat
+  coachContext.available = reference ~= nil
+  coachContext.status = reference and reference.status or 0
+  for _, field in ipairs({'gas', 'brake', 'speed', 'gear', 'cue', 'cueIn', 'gasTrend', 'brakeTrend'}) do
+    coachContext[field] = reference and reference[field] or 0
+  end
 end
 
 local function openRun(context, id)
@@ -84,14 +116,25 @@ local function openRun(context, id)
   if not run then message = err return end
   active = run
   renameDraft = run.name
-  Playback.resetPlayer(player)
-  Ghost.useCar(ghost, run.car)
+  practice = run
+  sectionFrom, sectionTo = 0, Playback.duration(run.samples, run.dt)
+  if prefs.sectionRun == id and prefs.sectionEnd > prefs.sectionStart then
+    local section = Lesson.section(run, prefs.sectionStart, prefs.sectionEnd)
+    if section then
+      practice = section
+      sectionFrom, sectionTo = prefs.sectionStart, prefs.sectionEnd
+    end
+  end
+  resetAttempt(true)
+  Ghost.useCar(ghost, run.car, run.skin and run.skin ~= '' and run.skin or ac.getCarSkinID(0), 0)
   status = nil
 end
 
 local function finishRecording(context)
-  local samples = Recorder.stop(recorder)
+  local samples, visuals = Recorder.stop(recorder)
   anchorX = nil
+  context = recordingContext or context
+  recordingContext = nil
   if not context then
     message = 'The session ended before the run could be saved.'
     return
@@ -102,12 +145,13 @@ local function finishRecording(context)
   end
   local name = prefs.recordName ~= '' and prefs.recordName or 'Teaching run'
   local id, err = Runs.save(context.track, context.layout, context.car, {
-    name = name, when = os.time(), dt = Recorder.INTERVAL, samples = samples,
+    name = name, when = os.time(), dt = Recorder.INTERVAL, samples = samples, visuals = visuals, skin = recordingSkin or '',
   })
   if not id then message = err return end
   indexKey = nil
   prefs.teaching, prefs.teachingKey = id, keyOf(context)
   openRun(context, id)
+  recordingSkin = nil
   message = 'Saved ' .. name .. '.'
 end
 
@@ -115,6 +159,8 @@ local function toggleRecord(context)
   if recorder.recording then finishRecording(context) return end
   if not context then message = 'Start a driving session before recording.' return end
   Recorder.start(recorder)
+  recordingContext, recordingSkin = context, ac.getCarSkinID(0)
+  visualRecorder = Visuals.new()
   anchorX = nil
   message = nil
 end
@@ -122,15 +168,17 @@ end
 function script.update(dt)
   local sim = ac.getSim()
   dt = type(dt) == 'number' and dt > 0 and dt or 0
+  if dt > 0.25 then resetAttempt() end
   if recordButton:pressed() then toggleRecord(contextOf(ac.getCar(0))) end
-  if resetButton:pressed() then Playback.resetPlayer(player) end
+  if resetButton:pressed() then resetAttempt() end
 
   local playerCar = ac.getCar(0)
   local context = contextOf(playerCar)
   local wasRecording = recorder.recording
   if recorder.recording then
-    if not context then
+    if not context or keyOf(context) ~= keyOf(recordingContext) then
       Recorder.observe(recorder, nil, dt, { paused = true })
+      finishRecording(recordingContext)
     else
       local pos, look, up = playerCar.transform.position, playerCar.look, playerCar.up
       local vx, vz = playerCar.velocity.x, playerCar.velocity.z
@@ -141,15 +189,20 @@ function script.update(dt)
         local dx, dy, dz = pos.x - anchorX, pos.y - anchorY, pos.z - anchorZ
         jump = dx * dx + dy * dy + dz * dz > limit * limit
       end
+      if jump then visualRecorder = Visuals.new() end
+      local visual = not (sim.isPaused or sim.isInMainMenu or sim.isReplayActive) and Visuals.capture(visualRecorder, playerCar, dt) or nil
       Recorder.observe(recorder, {
         pos.x, pos.y, pos.z, look.x, look.y, look.z, up.x, up.y, up.z, speed,
         clamp(playerCar.gas, 0, 1), clamp(playerCar.brake, 0, 1), clamp(playerCar.handbrake, 0, 1),
         clamp(playerCar.clutch, 0, 1), playerCar.steer or 0, playerCar.gear or 0, slipOf(playerCar),
-      }, dt, { paused = sim.isPaused or sim.isInMainMenu, replay = sim.isReplayActive, jump = jump })
+      }, dt, { paused = sim.isPaused or sim.isInMainMenu, replay = sim.isReplayActive, jump = jump }, visual)
       anchorX, anchorY, anchorZ = pos.x, pos.y, pos.z
     end
     status = recorder.note
-    if wasRecording and not recorder.recording then finishRecording(context) end
+    if wasRecording and not recorder.recording and recordingContext then
+      -- Automatic stop at the sample limit; an explicit save already cleared it.
+      finishRecording(context)
+    end
   end
 
   if context and prefs.teaching ~= '' and prefs.teachingKey == keyOf(context) and bootedKey ~= prefs.teachingKey then
@@ -158,29 +211,46 @@ function script.update(dt)
   end
 
   local follow = sim.focusedCar >= 0 and ac.getCar(sim.focusedCar) or playerCar
-  local match
-  if active and follow and follow.transform and follow.isConnected ~= false then
+  local match, reference
+  local followContext = contextOf(follow)
+  local nextFollowKey = followContext and keyOf(followContext)..'|'..follow.index..'|'..tostring(sim.isReplayActive)
+  if nextFollowKey ~= followKey then resetAttempt(); followKey = nextFollowKey end
+  if practice and followContext and keyOf(followContext) == keyOf(practice) and follow.transform and not recorder.recording then
     local pos = follow.transform.position
     local vx, vz = follow.velocity.x, follow.velocity.z
     local speed = math.sqrt(vx * vx + vz * vz)
-    local step = (sim.isPaused or sim.isReplayActive) and 0 or math.min(dt, 0.25)
-    local index, distance, pose, waiting = Playback.advance(player, active.samples, active.dt,
-      pos.x, pos.y, pos.z, speed, clamp(prefs.radius, 2, 12), step)
-    if pose and prefs.ghost ~= false then
+    local step = (sim.isPaused or sim.isReplayActive or sim.isInMainMenu or dt > 0.25) and 0 or dt
+    -- Rearm after leaving the start area and returning for another attempt. The
+    -- learner drives the car back; the app never teleports or changes physics.
+    if attempt.started then
+      local sx, sy, sz = Playback.xyz(practice.samples, 1)
+      local dx, dy, dz = pos.x-sx, pos.y-sy, pos.z-sz
+      if dx*dx+dy*dy+dz*dz > (prefs.radius+3)^2 then player._leftStart = true end
+      if player._leftStart and dx*dx+dy*dy+dz*dz <= prefs.radius^2 then resetAttempt() end
+    end
+    local index, distance, pose, waiting = Playback.advance(player, practice.samples, practice.dt,
+      pos.x, pos.y, pos.z, speed, clamp(prefs.radius, 2, 12), step, follow.velocity.x, follow.velocity.z)
+    if pose then pose.visual = Playback.visualPose(practice.visuals, player.time, practice.dt, pose.visual) end
+    if pose and prefs.ghost ~= false and prefs.guides ~= false then
       if Ghost.place(ghost, pose, true) then Ghost.drawFallback(ghost) end
     else
       Ghost.place(ghost, nil, false)
     end
-    if index and distance and distance <= 12 then
-      local recorded = Playback.field(active.samples, index, 17)
+    reference = Coaching.evaluate(practice, index, distance, follow, waiting, attempt.done, sim.isReplayActive, player._reference)
+    if reference and not sim.isReplayActive then
+      Lesson.observe(attempt, reference, follow, step, index, Playback.count(practice.samples), player.started)
+      if attempt.done then reference.status, reference.comparable, reference.cue = Coaching.FINISHED, false, 0 end
+    end
+    if reference and reference.comparable then
+      local recorded = Playback.field(practice.samples, index, 17)
       match = {
-        gas = Playback.field(active.samples, index, 11),
-        brake = Playback.field(active.samples, index, 12),
-        handbrake = Playback.field(active.samples, index, 13),
-        clutch = Playback.field(active.samples, index, 14),
-        steer = Playback.field(active.samples, index, 15),
+        gas = reference.gas,
+        brake = reference.brake,
+        handbrake = Playback.field(practice.samples, index, 13),
+        clutch = Playback.field(practice.samples, index, 14),
+        steer = Playback.field(practice.samples, index, 15),
         slip = recorded,
-        delta = player.started and (player.time - (index - 1) * active.dt) or 0,
+        delta = player.started and (player.time - (index - 1) * practice.dt) or 0,
         angleDelta = slipOf(follow) - recorded,
         waiting = waiting,
         distance = distance,
@@ -194,9 +264,14 @@ function script.update(dt)
     Ghost.place(ghost, nil, false)
     player._waiting, player._ended, player._distance = false, false, nil
   end
-  if active then Ghost.useCar(ghost, active.car) end
-  Paint.sync(paint, prefs.line ~= false and active or nil, prefs.line ~= false, clamp(prefs.opacity, 0.15, 1), clamp(prefs.radius, 2, 12))
-  publish(match)
+  if active and followContext and keyOf(followContext) == keyOf(active) and prefs.ghost ~= false and prefs.guides ~= false then
+    Ghost.useCar(ghost, active.car, active.skin and active.skin ~= '' and active.skin or ac.getCarSkinID(follow.index), follow.index)
+  end
+  local showLine = prefs.line ~= false and prefs.guides ~= false and not recorder.recording and followContext and practice
+    and keyOf(followContext) == keyOf(practice)
+  Paint.sync(paint, showLine and practice or nil, showLine, clamp(prefs.opacity, 0.15, 1), clamp(prefs.radius, 2, 12))
+  publish(prefs.guides ~= false and match or nil, prefs.guides ~= false and reference or nil)
+  player._reference = reference
   player._match = match
 end
 
@@ -221,15 +296,39 @@ function script.windowMain()
     if ui.button('Record') then toggleRecord(context) end
   end
   ui.sameLine()
-  if ui.button('Reset ghost') then Playback.resetPlayer(player) end
+  if ui.button('Reset attempt') then resetAttempt() end
   ui.separator()
   if ui.checkbox('Painted line', prefs.line ~= false) then prefs.line = not (prefs.line ~= false) end
   ui.sameLine()
   if ui.checkbox('Ghost car', prefs.ghost ~= false) then prefs.ghost = not (prefs.ghost ~= false) end
+  if ui.checkbox('Show learning guides', prefs.guides ~= false) then prefs.guides = not (prefs.guides ~= false) end
   if not active then
     ui.textWrapped('Record a clean run, then have your friend drive through the white start circle. The ghost follows your timing. The painted line and Drift HUD show what you did at their position.')
   else
     ui.text(active.name .. string.format('  /  %.0f s', Playback.duration(active.samples, active.dt)))
+    ui.text('Practice section')
+    local duration = Playback.duration(active.samples, active.dt)
+    sectionFrom = ui.slider('Start', sectionFrom, 0, duration, '%.1f s')
+    sectionTo = ui.slider('End', sectionTo, 0, duration, '%.1f s')
+    if ui.button('Practise section') then
+      local section, err = Lesson.section(active, sectionFrom, sectionTo)
+      if section then
+        practice = section
+        prefs.sectionRun, prefs.sectionStart, prefs.sectionEnd = active.id, sectionFrom, sectionTo
+        resetAttempt(true); message = nil
+      else message = err end
+    end
+    ui.sameLine()
+    if ui.button('Whole run') then
+      practice = active; prefs.sectionRun = ''; sectionFrom, sectionTo = 0, duration; resetAttempt(true)
+    end
+    ui.text(string.format('Practising %.1f s. Start: %.0f km/h / gear %d', Playback.duration(practice.samples, practice.dt),
+      Playback.field(practice.samples, 1, 10)*3.6, Playback.field(practice.samples, 1, 16)))
+    ui.textWrapped(Lesson.summary(attempt))
+    if lastSummary then ui.textWrapped('Previous attempt: '..lastSummary) end
+    if not active.visuals then ui.textWrapped('Older recording: record a new demo to capture body and wheel movement.') end
+    if not active.skin or active.skin == '' then ui.textWrapped('No saved paint for this recording. The ghost uses the current skin.') end
+    if player._reference then ui.textWrapped(Coaching.statusText(player._reference.status)) end
     if player._waiting then ui.text('Drive through the start circle to release the ghost.')
     elseif player._match then ui.text(Playback.gapText(player._match.delta))
     elseif player._distance then ui.text(string.format('%.0f m off the recorded line', player._distance)) end
@@ -265,7 +364,7 @@ function script.windowMain()
       if pendingDelete == entry.id then
         if ui.button('Confirm delete') then
           Runs.delete(context.track, context.layout, context.car, entry.id)
-          if active and active.id == entry.id then active = nil Ghost.clear(ghost) Playback.resetPlayer(player) end
+          if active and active.id == entry.id then active, practice = nil, nil; Ghost.clear(ghost); resetAttempt() end
           if prefs.teaching == entry.id then prefs.teaching = '' end
           pendingDelete, indexKey = nil, nil
         end
@@ -289,9 +388,10 @@ function script.windowSettings()
   resetButton:control(vec2(220, 24))
   ui.separator()
   ui.textWrapped('Chase cameras are chosen in CSP settings. Drift Passenger, Drift Coach and Drift Wheel are separate scripts. This window does not switch them.')
-  ui.textWrapped('Green paint is throttle, red is brake, purple is handbrake and a blue circle is a clutch kick. Drift HUD can draw the recorded pedals on top of the live meters. The ghost body does not steer its wheels.')
+  ui.textWrapped('Green is throttle, red is brake, grey is near-zero throttle and foot brake, purple is handbrake and a blue circle marks clutch application. Drift HUD shows demo / learner pedal amounts. References pause when your line, speed, direction or gear differs too much.')
+  ui.textWrapped('Recordings made with this version save paint, visual body movement and wheel movement. Hide learning guides to practise without the line, ghost or pedal references.')
 end
 
 ac.onCarJumped(0, function()
-  Playback.resetPlayer(player)
+  resetAttempt()
 end)

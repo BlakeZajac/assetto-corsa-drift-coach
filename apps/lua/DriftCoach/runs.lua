@@ -31,21 +31,30 @@ local function clean(value)
 end
 
 function M.encode(run)
+  local visual = run.visuals ~= nil
   local lines = {
-    'DRIFTCOACH 1',
+    'DRIFTCOACH 2',
     clean(run.name),
     clean(run.track),
     clean(run.layout),
     clean(run.car),
     tostring(math.floor(run.when or 0)),
-    string.format('%.5f', run.dt or Playback.INTERVAL),
+    string.format('%.10f', run.dt or Playback.INTERVAL),
     tostring(Playback.count(run.samples)),
+    clean(run.skin),
+    visual and tostring(Playback.VISUAL_STRIDE) or '0',
   }
   local stride = Playback.STRIDE
   for base = 1, #run.samples, stride do
     local row = {}
     for k = 0, stride - 1 do
       row[k + 1] = string.format('%.4f', run.samples[base + k] or 0)
+    end
+    if visual then
+      local vbase = (base - 1) / stride * Playback.VISUAL_STRIDE
+      for k = 1, Playback.VISUAL_STRIDE do
+        row[#row+1] = string.format('%.5f', run.visuals[vbase+k] or 0)
+      end
     end
     lines[#lines + 1] = table.concat(row, ' ')
   end
@@ -65,25 +74,34 @@ function M.decode(text)
     lines[#lines + 1] = text:sub(startAt, newline - 1):gsub('\r$', '')
     startAt = newline + 1
   end
-  if lines[1] ~= 'DRIFTCOACH 1' then return nil, 'unrecognised run file' end
+  local v2 = lines[1] == 'DRIFTCOACH 2'
+  if not v2 and lines[1] ~= 'DRIFTCOACH 1' then return nil, 'unrecognised run file' end
   local count = tonumber(lines[8])
-  if not count or count < 2 then return nil, 'run is too short' end
+  local interval = tonumber(lines[7])
+  if not count or count < 2 or count > 10800 or count ~= math.floor(count) then return nil, 'invalid run length' end
+  if not interval or interval ~= interval or interval <= 0 or interval > 1 then return nil, 'invalid sample interval' end
+  local visualStride = v2 and tonumber(lines[10]) or 0
+  if visualStride ~= 0 and visualStride ~= Playback.VISUAL_STRIDE then return nil, 'unsupported visual sample format' end
+  local visuals = visualStride > 0 and {} or nil
   local samples = {}
   local rows = 0
-  for i = 9, #lines do
+  for i = v2 and 11 or 9, #lines do
     rows = rows + 1
     local fields = 0
     for word in lines[i]:gmatch('%S+') do
       fields = fields + 1
-      samples[#samples + 1] = tonumber(word) or 0
+      local value = tonumber(word)
+      if not value or value ~= value or math.abs(value) == math.huge then return nil, 'invalid sample value' end
+      if fields <= Playback.STRIDE then samples[#samples+1] = value
+      elseif visuals then visuals[#visuals+1] = value end
     end
-    if fields ~= Playback.STRIDE then return nil, 'damaged run sample' end
+    if fields ~= Playback.STRIDE + visualStride then return nil, 'damaged run sample' end
   end
   if rows ~= count then return nil, 'run file was cut short' end
   return {
     name = lines[2], track = lines[3], layout = lines[4], car = lines[5],
-    when = tonumber(lines[6]) or 0, dt = tonumber(lines[7]) or Playback.INTERVAL,
-    samples = samples,
+    when = tonumber(lines[6]) or 0, dt = interval,
+    samples = samples, visuals = visuals, skin = v2 and lines[9] or '',
   }
 end
 

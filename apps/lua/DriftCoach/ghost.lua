@@ -1,6 +1,5 @@
--- Translucent copy of the recorded car. Wheels stay straight; the recorded
--- steer angle is shown by Drift HUD instead. A debug box stands in until the
--- model loads, and remains if the KN5 cannot be found.
+-- Render a recorded visual pose. This is a scene object, never a second
+-- physics car. World-space wheel poses preserve countersteer and suspension.
 local M = {}
 
 local function existing(root, name)
@@ -11,11 +10,15 @@ local function existing(root, name)
   return nil
 end
 
-function M.findModel(carId)
+function M.findModel(carId, carIndex)
   if not carId or carId == '' then return nil, nil end
   local root = ac.getFolder(ac.FolderID.ContentCars) .. '/' .. carId
   local main, lod
   local ok, lods = pcall(ac.INIConfig.load, root .. '/data/lods.ini')
+  if carIndex ~= nil and ac.getCarID(carIndex) == carId then
+    local packedOK, packed = pcall(ac.INIConfig.carData, carIndex, 'lods.ini')
+    if packedOK and packed then ok, lods = true, packed end
+  end
   if ok and lods then
     main = existing(root, lods:get('LOD_0', 'FILE', ''))
     lod = existing(root, lods:get('LOD_1', 'FILE', ''))
@@ -36,7 +39,7 @@ end
 
 function M.new()
   return {
-    token = 0, carId = nil, error = nil, model = nil, root = nil,
+    token = 0, carId = nil, skinId = nil, error = nil, model = nil, root = nil, wheels = {},
     position = vec3(), look = vec3(), up = vec3(), tip = vec3(), fallback = false, shown = false,
   }
 end
@@ -55,17 +58,20 @@ end
 
 function M.clear(state)
   state.token = state.token + 1
-  state.carId, state.model, state.error, state.shown = nil, nil, nil, false
+  state.carId, state.skinId, state.model, state.error, state.shown = nil, nil, nil, nil, false
+  state.wheels = {}
   if state.root then pcall(function() state.root:dispose() end) end
   state.root = nil
 end
 
-function M.useCar(state, carId)
+function M.useCar(state, carId, skinId, carIndex)
+  skinId = type(skinId) == 'string' and not skinId:find('[/\\:%c]') and skinId ~= '..' and skinId ~= '.' and skinId or ''
   local loading = state.root and not state.error and not state.model
-  if state.carId == carId and (state.model or loading or (state.error and state.error ~= 'Car scene is not available yet')) then return end
+  if state.carId == carId and state.skinId == skinId and (state.model or loading or (state.error and state.error ~= 'Car scene is not available yet')) then return end
   M.clear(state)
   state.carId = carId
-  local main, lod = M.findModel(carId)
+  state.skinId = skinId
+  local main = M.findModel(carId, carIndex)
   if not main then
     state.error = 'No visual model found for ' .. tostring(carId)
     return
@@ -93,12 +99,25 @@ function M.useCar(state, carId)
       state.error = err or 'Could not load the car model'
       return
     end
+    -- Use the full model so nearby wheel nodes and body detail are available.
     local materialError = ghostify(node)
+    if skinId ~= '' then
+      local skinDir = ac.getFolder(ac.FolderID.ContentCars)..'/'..carId..'/skins/'..skinId
+      local ok = io.dirExists(skinDir) and pcall(function() node:applySkin(skinDir) end)
+      if not ok then state.error = 'Could not apply the recorded paint.' end
+    end
+    for i,name in ipairs({'LF','RF','LR','RR'}) do
+      local wheel = node:findNodes('WHEEL_'..name)
+      local suspension = node:findNodes('SUSP_'..name)
+      state.wheels[i] = {
+        wheel = not wheel:empty() and wheel or nil,
+        suspension = not suspension:empty() and suspension or nil,
+      }
+    end
     state.model = node
-    state.error = materialError and 'Model loaded, transparency skipped' or nil
+    if materialError then state.error = 'Model loaded, transparency skipped' end
   end
-  if lod then state.root:loadKN5LODAsync(lod, main, loaded)
-  else state.root:loadKN5Async(main, loaded) end
+  state.root:loadKN5Async(main, loaded)
 end
 
 local function basis(state, pose)
@@ -115,6 +134,20 @@ local function basis(state, pose)
   state.up:set(ux / mag, uy / mag, uz / mag)
 end
 
+local function transformOf(values, first)
+  if values[first+3]^2+values[first+4]^2+values[first+5]^2 < 0.1 then return nil end
+  return mat4x4.look(vec3(values[first],values[first+1],values[first+2]),
+    vec3(values[first+3],values[first+4],values[first+5]),vec3(values[first+6],values[first+7],values[first+8]))
+end
+
+local function placeWorld(node, world)
+  if not node then return end
+  local parent = node:getParent()
+  local parentWorld = parent and parent:getWorldTransformationRaw()
+  -- SDK matrices use world * inverse(parent) for a local transformation.
+  node:getTransformationRaw():set(parentWorld and world:mul(parentWorld:inverse()) or world)
+end
+
 -- Returns true when the caller should draw the debug-box stand-in.
 function M.place(state, pose, visible)
   state.fallback = false
@@ -126,8 +159,23 @@ function M.place(state, pose, visible)
   state.position:set(pose[1], pose[2], pose[3])
   basis(state, pose)
   if state.root and state.model then
-    state.root:setPosition(state.position)
-    state.root:setOrientation(state.look, state.up)
+    local visual = pose.visual
+    local body = visual and transformOf(visual, 1)
+    if body then
+      placeWorld(state.root,body)
+      for i,refs in ipairs(state.wheels) do
+        local first = 10+(i-1)*10
+        local suspension = transformOf(visual,first)
+        if suspension then
+          placeWorld(refs.suspension,suspension)
+          local spin = mat4x4.rotation(visual[first+9],vec3(1,0,0))
+          placeWorld(refs.wheel,spin:mul(suspension))
+        end
+      end
+    else
+      state.root:setPosition(state.position)
+      state.root:setOrientation(state.look, state.up)
+    end
     if not state.shown then state.root:setVisible(true, true) end
     state.shown = true
     return false

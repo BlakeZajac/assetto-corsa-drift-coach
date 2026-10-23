@@ -1,6 +1,7 @@
 -- Playback timing and spot matching. Samples use recorder.lua's 17-wide stride.
 local M = {}
 M.STRIDE = 17
+M.VISUAL_STRIDE = require('visuals').STRIDE
 M.INTERVAL = 1 / 30
 local WINDOW_BACK = 8
 local WINDOW_AHEAD = 45
@@ -9,6 +10,22 @@ local LOST = 12
 function M.count(samples)
   if not samples then return 0 end
   return math.floor(#samples / M.STRIDE)
+end
+
+function M.visualPose(visuals, time, dt, out)
+  if not visuals then return nil end
+  local n=math.floor(#visuals/M.VISUAL_STRIDE)
+  if n==0 then return nil end
+  out=out or {}
+  local frame=math.max(0, math.min(n-1,time/dt))
+  local index=math.min(n,math.floor(frame)+1)
+  local blend=frame-(index-1)
+  for k=1,M.VISUAL_STRIDE do
+    local a=visuals[(index-1)*M.VISUAL_STRIDE+k] or 0
+    local b=visuals[math.min(n-1,index)*M.VISUAL_STRIDE+k] or a
+    out[k]=a+(b-a)*blend
+  end
+  return out
 end
 
 function M.xyz(samples, index)
@@ -116,16 +133,29 @@ function M.resetPlayer(player)
   player.started = false
   player.time = 0
   player.cursor = 1
+  player._leftStart = false
+  player._reference, player._match = nil, nil
+  player._waiting, player._ended, player._distance = true, false, nil
 end
 
 -- `step` is the frame delta in seconds, or 0 while paused. The ghost waits
 -- at the first sample until the car drives through the start circle.
-function M.advance(player, samples, dt, x, y, z, speed, radius, step)
+function M.advance(player, samples, dt, x, y, z, speed, radius, step, vx, vz)
   local n = M.count(samples)
   if n == 0 then return nil, nil, nil, true end
   local sx, sy, sz = M.xyz(samples, 1)
   local dx, dy, dz = x - sx, y - sy, z - sz
-  if not player.started and dx * dx + dy * dy + dz * dz <= radius * radius and (speed or 0) >= 2 then
+  local forward = true
+  if vx and vz then
+    local tx, tz = 0, 0
+    for i = 2, math.min(n, 31) do
+      local px, _, pz = M.xyz(samples, i)
+      tx, tz = px - sx, pz - sz
+      if tx*tx+tz*tz > 1 then break end
+    end
+    forward = tx*vx+tz*vz > 0
+  end
+  if not player.started and (step or 0) > 0 and forward and dx * dx + dy * dy + dz * dz <= radius * radius and (speed or 0) >= 2 then
     player.started = true
     player.time = 0
     player.cursor = 1
