@@ -1,5 +1,6 @@
 package.path = 'apps/lua/DriftCoach/?.lua;' .. package.path
 local P, C = require('playback'), require('coaching')
+local Paint = require('paint')
 local L = require('lesson')
 local R, Runs, Visuals = require('recorder'), require('runs'), require('visuals')
 local count = 0
@@ -145,5 +146,58 @@ test('warning hysteresis avoids flicker and varying speed still yields a summary
     L.observe(a,ref,c,1/30,40+i,180,true)
   end
   assert(a.first and a.first.text:find('slower'))
+end)
+test('the surface ray stays under a bridge deck and lands on the road beneath the car',function()
+  local carY, roadY, deckY = 0.45, 0.05, 4.5
+  local px, py, pz = Paint.project(12, carY, -4, function(x, y, z, reach)
+    near(x, 12); near(z, -4)
+    assert(y < deckY)
+    assert(y - reach <= roadY and y >= roadY)
+    return y - roadY, roadY
+  end)
+  near(px, 12); near(py, roadY); near(pz, -4)
+end)
+test('a run recorded on the bridge stays on the deck',function()
+  local deckY = 4.5
+  local _, py = Paint.project(12, deckY + 0.35, -4, function(_, y, _, reach)
+    if y >= deckY and y - reach <= deckY then return y - deckY, deckY end
+    return -1
+  end)
+  near(py, deckY)
+end)
+test('a missed surface ray keeps the recorded height',function()
+  local _, py = Paint.project(1, 2.5, 3, function() return -1 end)
+  near(py, 2.5)
+end)
+test('painted segments use the short ray and skip track paint casting',function()
+  local drawn = {}
+  rgbm = function(...) return {...} end
+  vec3 = function(x, y, z)
+    local v = {x = x or 0, y = y or 0, z = z or 0}
+    function v:set(a, b, c) self.x, self.y, self.z = a, b, c return self end
+    return v
+  end
+  ac = {TrackPaint = function()
+    local paint = {reset = function() drawn = {} end, circle = function() end,
+      line = function(_, a, b) drawn[#drawn + 1] = {a.y, b.y} end}
+    return paint
+  end}
+  physics = {raycastTrack = function(pos, _, length, point)
+    assert(length < 4)
+    assert(pos.y < 4)
+    point.y = 0.2
+    return pos.y - 0.2
+  end}
+  local samples = {}
+  for i = 1, 3 do
+    local row = {10 + i, 1.1, -4}
+    for k = 4, 17 do row[k] = 0 end
+    for _, v in ipairs(row) do samples[#samples + 1] = v end
+  end
+  local state = Paint.new()
+  assert(state.paint.castStep == math.huge and state.paint.alignShapes == false)
+  Paint.sync(state, {id = 'bridge', samples = samples}, true, 0.9, 4)
+  assert(#drawn == 2)
+  near(drawn[1][1], 0.2); near(drawn[1][2], 0.2); near(drawn[2][2], 0.2)
 end)
 print(count..' Drift Coach checks passed')
